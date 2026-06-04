@@ -1,0 +1,22 @@
+{
+  "name": "instashare",
+  "owner": {
+    "name": "Instafill",
+    "url": "https://github.com/Instafill"
+  },
+  "metadata": {
+    "description": "InstaShare — share Claude Code chat sessions as public links",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "instashare",
+      "description": "Upload the current Claude Code chat session to instashare.to and return a public share link.",
+      "source": "./",
+      "strict": false,
+      "skills": [
+        "./skills/instashare"
+      ]
+    }
+  ]
+}
