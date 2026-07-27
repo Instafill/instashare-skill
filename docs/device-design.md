@@ -1,116 +1,115 @@
 # Design: a physical session display for Claude Code
 
-A small desk device — a screen and a couple of buttons — that shows the **model** and **reasoning effort** of your running Claude Code session(s), and lets you flip between multiple open sessions (e.g. several PowerShell windows) with the buttons.
+A small desk device — a screen and buttons — that shows the **model**, **reasoning effort**, and **activity state** of your running Claude Code sessions, follows whichever window you're focused on, and lets you switch between sessions from the device itself.
 
-**Feasibility verdict: yes, buildable with off-the-shelf hobby parts, and multi-window support works natively.** Claude Code's statusline feature delivers exactly the data needed, per session, in near-realtime. This document is the design and research write-up; no code yet.
+**Scope: commercial product, not a hobby build.** That constraint drives most decisions below — zero-install hardware, no WiFi provisioning, works on corporate-managed machines, cheap certification path.
 
-## 1. Where the data comes from
+**Feasibility verdict: buildable.** Claude Code's statusline feature emits exactly the required data, per session, in near-realtime.
 
-Claude Code can run a user-configured **statusline command** and passes it a JSON payload on stdin
-(docs: <https://code.claude.com/docs/en/statusline>). The payload includes everything the device needs:
+## 1. Decisions locked
+
+| Decision | Choice | Why |
+| --- | --- | --- |
+| Transport | **USB-C, CDC-ACM** | Driverless on Win10+/macOS/Linux. No WiFi password, no radio certification, works on locked-down corporate networks. |
+| Setup | **Composite CDC + mass storage** | Device also enumerates a small read-only drive holding the one-time setup file. No download, no admin rights. |
+| Host software | **Background daemon + statusline script** | Required for focus-following; also unlocks activity state and bidirectional buttons. |
+| Session selection | **Follow focused window, buttons override** | Auto-follow with a most-recently-active fallback. |
+| WiFi | **Deferred, not rejected** | Daemon abstracts transport; WiFi becomes a later SKU without redesign. |
+
+## 2. Where the data comes from
+
+Claude Code runs a user-configured **statusline command**, passing a JSON payload on stdin
+(docs: <https://code.claude.com/docs/en/statusline>):
 
 | Field | Example | Notes |
 | --- | --- | --- |
-| `session_id` | `"abc123…"` | Unique per session — the key that makes multi-window support work |
-| `model.display_name` | `"Opus"` | Bare name; **no** `(1M context)` marker (that can be inferred from `context_window.context_window_size`) |
-| `model.id` | `"claude-opus-5"` | |
-| `effort.level` | `"high"` | `low / medium / high / xhigh / max`; **live**, reflects mid-session `/effort` changes; absent for models without effort support |
-| `cwd`, `workspace.project_dir` | `"C:/projects/foo"` | Useful to label which window is which |
-| `context_window.used_percentage` | `8` | Nice-to-have extra display page |
+| `session_id` | `"abc123…"` | Unique per session — the key for multi-session tracking |
+| `model.display_name` | `"Opus"` | Bare name; **no** `(1M context)` marker (infer from `context_window.context_window_size`) |
+| `effort.level` | `"high"` | `low / medium / high / xhigh / max`; live, reflects mid-session `/effort`; absent on models without effort support |
+| `cwd`, `workspace.project_dir` | `"C:/projects/foo"` | Labels the session; also used for tab-title matching (§5) |
+| `context_window.used_percentage` | `8` | Secondary display page |
 
 Invocation behavior that shapes the design:
 
-- The statusline command fires on session start/resume, each assistant message, mode changes, and an optional `refreshInterval` timer, debounced at 300 ms.
-- **Each open session invokes it independently with its own `session_id`.** Three PowerShell windows → three independent streams of updates. This is why "will it support multiple PowerShell windows" is a yes by construction.
-- On Windows the command can be a PowerShell script: `"statusLine": { "type": "command", "command": "powershell -NoProfile -File C:/Users/<you>/.claude/statusline.ps1" }` (forward slashes).
-- There is **no session-ended event** — a closed window simply stops sending. Stale sessions must age out on the device (see §6).
+- Fires on session start/resume, each assistant message, mode changes, and an optional `refreshInterval`, debounced 300 ms.
+- **Each session invokes it independently with its own `session_id`.** Multi-window support is inherent.
+- On Windows the command can be a PowerShell script; configure with forward slashes.
+- **No session-ended event.** The daemon detects termination by watching the process instead of relying on timeouts.
 
-## 2. Architecture
+## 3. Architecture
 
 ```
-PowerShell window 1 ─ statusline script ─┐
-PowerShell window 2 ─ statusline script ─┼─ HTTP POST /session ──> device (WiFi, LAN-only)
-PowerShell window 3 ─ statusline script ─┘        ~1 KB JSON            │
-                                                              session table keyed by session_id
-                                                              screen shows one session; buttons cycle
+Claude Code session 1 ─ statusline script ─┐
+Claude Code session 2 ─ statusline script ─┼─> named pipe / localhost ─> HOST DAEMON
+Claude Code session 3 ─ statusline script ─┘                                 │
+                                                                             │ owns USB port (by VID/PID)
+   foreground-window hook ──────────────────────────────────────────────────>│ USB CDC-ACM, bidirectional
+   process watcher (session death) ─────────────────────────────────────────>│         │
+                                                                        button events  v
+                                                                             <──── DEVICE
 ```
 
-Each statusline render does a **fire-and-forget HTTP POST** of `{session_id, model, effort, cwd, ts}` to the device, with a short timeout (~250 ms) so a powered-off device never slows the statusline down. The device keeps a table keyed by `session_id`, last-write-wins, and expires entries that haven't updated recently. The buttons move a cursor through the table; the screen shows the selected session with a `2/3`-style position marker.
+The statusline script is deliberately trivial: serialize the payload, write it to a local pipe, exit. All logic lives in the daemon, which is the only process that touches the USB port — so there is no port contention between sessions.
 
-## 3. How the device connects to the computer
+## 4. Host daemon responsibilities
 
-| Option | How it works | Multi-window | Host-side software | Verdict |
-| --- | --- | --- | --- | --- |
-| **WiFi** (recommended) | Device joins your LAN, runs a tiny HTTP server | Natural — every window POSTs independently | None beyond the one-line POST in the statusline script | **Recommended** |
-| **USB serial** | Device on a COM port | Needs an always-running host daemon: Windows COM ports are single-owner, so the windows can't all write to it directly | Daemon (COM discovery, lifetime management) | Fallback if no radio is wanted; **most secure** |
-| **Bluetooth** | Classic SPP appears as a virtual COM port; BLE uses WinRT APIs | SPP inherits the same single-owner COM problem as USB (daemon needed); BLE needs WinRT code instead of a one-line HTTP call | Daemon or WinRT client | Not recommended — wireless, but with the worst of both worlds |
+- **Ingest** statusline pushes from every session over a named pipe (Windows) or Unix socket.
+- **Track focus** via an event-driven foreground-window hook (`SetWinEventHook`/`EVENT_SYSTEM_FOREGROUND` on Windows; `NSWorkspace.frontmostApplication` on macOS — note this needs **no** Accessibility permission at app level).
+- **Map window → session**: walk the statusline script's parent process chain at render time to record which terminal process owns each session, then resolve the foreground window's PID against that map.
+- **Detect session death** by watching the Claude Code process, removing it from the display immediately.
+- **Enrich state** beyond the statusline payload — most valuably **"waiting for approval"**, the highest-value signal for a peripheral display.
+- **Own the USB link**: discover the device by VID/PID, serialize state, receive button events.
+- **Act on button events**: switch displayed session, and bring a session's terminal window to the foreground.
 
-## 4. Security: is WiFi safe here?
+## 5. Known limitation: tabs vs. windows
 
-The key fact: **only metadata ever leaves the PC** — model name, effort level, session id, a directory path, a timestamp. No transcript content, no code, no keys. The realistic worst case on a hostile LAN is someone reading "Opus / high / C:\projects\foo" or spoofing a fake session tile onto the screen.
+Foreground-window detection resolves to a **window**, not a tab. Windows Terminal hosts all tabs in a single process under one window handle; macOS Terminal and iTerm2 behave the same. Three sessions in three tabs of one window are indistinguishable via the foreground-window API.
 
-With that threat model:
+**Mitigation**: read the foreground window's *title*, which reflects the active tab, and match it against the session's `cwd` (Claude Code sets the terminal title). This is a heuristic, not a guaranteed API.
 
-- **WiFi** is acceptable on a trusted home network with three cheap mitigations, all part of the firmware spec:
-  1. **LAN-only, listen-only.** The device accepts inbound POSTs and makes *no outbound connections at all*. Never port-forward it or expose it to the internet.
-  2. **Shared-secret header.** The statusline script sends `X-Device-Key: <token>`; firmware rejects requests without it. Stops casual LAN spoofing/reading.
-  3. **Minimal payload.** Optionally send only the tail of `cwd` (project folder name) rather than the full path.
-- **Bluetooth** is not meaningfully safer for this data. It is short-range and pairing-gated rather than IP-addressable, but BT/BLE stacks carry their own CVE history, and you pay the daemon/WinRT complexity from §3 for it.
-- **USB serial is the genuinely safest option** — no radio, physically attached. Choose it if security outweighs the convenience cost of running a host daemon.
+**Fallback**: when the title is ambiguous, select the most recently updated session among candidates. This must be built regardless — it is also the correct behavior when no Claude Code window is focused at all.
 
-Recommendation: WiFi with mitigations 1–2 for a home/trusted network; USB serial if the device will live somewhere untrusted.
+> Test this with tabs early. It works cleanly in development with separate windows and breaks on a real user's tabbed setup.
 
-## 5. Hardware options
+## 6. Device firmware spec
 
-| Option | Parts cost | Radio | Firmware stack | Difficulty | Fit |
-| --- | --- | --- | --- | --- | --- |
-| **ESP32 dev board** (recommended) | ~$5–8 | WiFi + BT | Arduino/PlatformIO or MicroPython | Low — huge community, HTTP server examples everywhere | Best all-round |
-| **Raspberry Pi Pico W** | ~$7 | WiFi | MicroPython-first | Low | Equivalent; pick if you prefer Python |
-| **Arduino Uno/Nano or Pico (non-W)** | ~$4–10 | none (USB) | Arduino | Low, but requires the host daemon | The USB-serial/security option |
-| **Desktop simulator** | $0 | n/a | Any local HTTP listener + window | Trivial | Validate the protocol before buying anything |
+- **Protocol**: newline-delimited JSON over CDC-ACM. Host → device: session table updates. Device → host: button events.
+- **Session table**: keyed by `session_id`, capacity ~8, authoritative from the daemon (no device-side expiry needed, since the daemon reports death explicitly).
+- **Screen** (128×64 OLED): model name large; effort badge; project name; `2/3` position marker; distinct state glyph for *working* / *waiting for approval* / *idle*.
+- **Buttons**: next/prev session; long-press pins a session (disabling auto-follow) or brings that terminal to the front. Debounce ~50 ms.
+- **Mass storage partition**: read-only, contains the setup file and a README. Never written by the device at runtime.
 
-### Parts list for the recommended build
+## 7. Hardware and BOM
 
-| Part | Indicative price |
+**ESP32-S3** or **RP2040** — both support USB composite (CDC + MSC) natively. RP2040 is cheaper and has excellent USB tooling; ESP32-S3 leaves the door open for the WiFi SKU on the same firmware base.
+
+| Part | Indicative unit cost (prototype) |
 | --- | --- |
-| ESP32 dev board (e.g. ESP32-DevKitC / WROOM-32) | ~$6 |
-| SSD1306 128×64 I²C OLED display | ~$4 |
-| 2× tactile push buttons | <$1 |
-| Breadboard + jumper wires (or solder direct) | ~$5 |
-| USB cable for power/flashing | ~$2 |
-| **Total** | **~$15–20** |
+| RP2040 or ESP32-S3 module | ~$4–6 |
+| SSD1306 128×64 I²C OLED | ~$4 |
+| 2× tactile buttons | <$1 |
+| USB-C connector, PCB, enclosure | ~$5–10 |
+| **Total** | **~$15–20** at prototype volumes |
 
-### Wiring sketch
+Wiring: OLED over I²C (two signal pins, e.g. GPIO21/22), buttons to GPIO with internal pull-ups, power from the USB cable.
 
-- OLED via I²C: `SDA → GPIO21`, `SCL → GPIO22`, plus 3.3 V and GND — two signal pins total.
-- Buttons: each between a GPIO (e.g. 32, 33) and GND, using the ESP32's internal pull-ups; pressed = LOW.
-- Power over the USB cable (from the PC or any USB charger).
+## 8. Commercial checklist
 
-## 6. Firmware behavior spec (prose, no code yet)
+- **USB VID/PID**: own VID from USB-IF (~$6k) or a sublicensed PID from pid.codes.
+- **EV code-signing certificate** (~$300–500/yr): mandatory. A daemon that hooks window events and inspects process trees *will* trip SmartScreen and EDR heuristics without it. Keep the binary small, single-purpose, and unobfuscated; consider submitting to AV vendors for whitelisting.
+- **Certification**: no intentional radiator on the USB SKU → substantially cheaper FCC/CE path than any wireless option.
+- **Installer must wrap, not clobber, an existing statusline.** Claude Code allows only **one** statusline command. Many developers already have one. Silently overwriting it is a far more likely product failure than any hardware decision.
 
-- **Endpoint**: `POST /session` accepting JSON `{session_id, model, effort, cwd, ts}`; requires the `X-Device-Key` header; responds `204`. Optional `GET /healthz` for setup debugging.
-- **Session table**: keyed by `session_id`, last-write-wins, capacity ~8. Entries older than **15 s** without an update are dropped (statusline fires at least every few seconds during activity; set `refreshInterval` for idle sessions).
-- **Screen layout** (128×64): line 1 model name large; line 2 effort badge (`HIGH`), line 3 tail of `cwd`; bottom-right `2/3` session position; a subtle "stale" glyph if the selected session hasn't updated in >5 s.
-- **Buttons**: next/prev session, debounced ~50 ms; long-press on one button toggles an extra page (context-window %, uptime). If the selected session expires, fall back to the most recently updated one.
-- **Addressing**: mDNS (`http://claude-display.local`) with a fixed-IP fallback; WiFi credentials + device key compiled in or set via a one-time serial setup prompt.
-- **No outbound connections. Ever.**
+## 9. Open questions
 
-## 7. Host setup spec (Windows)
+- `model.display_name` omits the `(1M context)` marker; infer from `context_window.context_window_size`.
+- `effort` is absent on models without effort support — omit the badge rather than showing a default.
+- Whether "waiting for approval" can be derived reliably from available signals, or needs process/pty inspection.
+- Linux/Wayland cannot support focus-following; that platform degrades to most-recently-active.
+- Whether buttons should be able to *change* model/effort by driving the session, not just display it.
 
-- A PowerShell statusline script that (a) renders whatever status text you want in the terminal and (b) fires the non-blocking POST with a ~250 ms timeout, swallowing all errors — a dead/absent device must never affect Claude Code.
-- Wired in `settings.json` as shown in §1. Only **one** statusLine command is configurable, so if you already have a statusline, the device push becomes a few extra lines inside it rather than a separate script.
-- The device key lives in the script (or an env var), matching the firmware.
+## 10. Next steps
 
-## 8. Limitations and open questions
-
-- `model.display_name` carries no `(1M context)` marker; if wanted, infer from `context_window.context_window_size` ≥ 1M.
-- `effort` is absent for models that don't support effort — the screen should just omit the badge.
-- Session end is detected only by expiry (no goodbye event), so a closed window lingers on screen for up to the expiry window.
-- WiFi provisioning UX (hardcoded vs. serial setup vs. captive portal) — decide when building.
-- Statusline update cadence during long idle periods depends on `refreshInterval`; without it, an idle session may look "stale" even though it's open.
-
-## 9. Next steps (out of scope for this document)
-
-1. Pick hardware (ESP32 + OLED recommended) — or start with the $0 desktop simulator to validate the protocol.
-2. Firmware implementing §6; statusline script implementing §7.
-3. Optional: a `device/` folder in this repo with firmware, the PowerShell script, and the simulator.
+1. Desktop simulator: daemon + fake screen window, validating the protocol and the tab-matching heuristic before hardware exists.
+2. Firmware on a dev board (§6), then host daemon (§4).
+3. Enclosure, VID/PID, signing, certification.
