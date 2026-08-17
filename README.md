@@ -13,7 +13,7 @@ Ask Claude things like:
 
 ## What it does
 
-- Finds the **active** session JSONL automatically (the most recently modified `~/.claude/projects/<slug>/<uuid>.jsonl`).
+- Uploads the session the agent is actually running in, identified by its **session id** (`~/.claude/projects/<slug>/<session-id>.jsonl`). Without an id it falls back to the newest transcript by mtime, but aborts rather than guessing when several were touched recently — a sibling session in the same working directory can be newer than yours.
 - POSTs the file to the InstaShare API, returns `{ url, deleteUrl }`.
 - On reruns, **reuses the same URL** via a sidecar file — links you already pasted keep showing the latest transcript.
 - Prints both the public URL and the revoke URL so the user stays in control.
